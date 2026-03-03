@@ -1,0 +1,6 @@
+node_modules/
+.env
+temp_ag_kit/
+test-init/
+tsconfig.json
+*.tgz
