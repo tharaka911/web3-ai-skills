@@ -1,6 +1,6 @@
 ---
 name: subgraph-indexing
-description: Chain indexing with The Graph, Ponder, Envio, and custom indexers. Event-driven data, GraphQL APIs, entity relationships, and real-time sync.
+description: Chain indexing with The Graph, Ponder, Subsquid, Envio, and custom indexers. Event-driven data, GraphQL APIs, entity relationships, and real-time sync.
 ---
 
 # Subgraph & Indexing — Blockchain Data Access
@@ -10,7 +10,7 @@ Expert knowledge for building efficient blockchain data indexing solutions.
 ## Use this skill when
 
 - Building subgraphs for The Graph
-- Setting up Ponder or Envio indexers
+- Setting up Ponder, Subsquid, or Envio indexers
 - Creating real-time data feeds from on-chain events
 - Designing entity schemas for blockchain data
 - Querying historical blockchain data efficiently
@@ -165,16 +165,215 @@ ponder.on('Token:Transfer', async ({ event, context }) => {
 
 ---
 
+## Subsquid (SQD / Squid SDK)
+
+### Overview
+Subsquid is a batch-processing blockchain indexer optimized for high-throughput multi-chain data. Uses the **SQD Network** as a decentralized data lake.
+
+### Project Structure
+```
+squid/
+├── src/
+│   ├── processor.ts     # EvmBatchProcessor config
+│   ├── main.ts          # Processing logic
+│   ├── model/           # TypeORM entities
+│   └── abi/             # Generated type-safe ABI wrappers
+├── db/
+│   └── migrations/      # Database migrations
+├── schema.graphql       # Entity definitions (generates model/)
+├── squid.yaml           # Deployment manifest
+├── commands.json        # CLI commands
+└── docker-compose.yml   # Local Postgres + GraphQL
+```
+
+### Installation
+```bash
+# Install Squid CLI
+npm i -g @subsquid/cli
+
+# Create new squid from EVM template
+sqd init my-squid -t evm
+
+# Generate ABI types
+npx squid-evm-typegen src/abi erc721.json
+# or from Etherscan:
+npx squid-evm-typegen src/abi 0x...contractAddress --etherscan-api https://api.etherscan.io/api
+```
+
+### Processor Configuration
+```typescript
+// src/processor.ts
+import { EvmBatchProcessor } from '@subsquid/evm-processor'
+import { lookupArchive } from '@subsquid/archive-registry'
+
+export const processor = new EvmBatchProcessor()
+  // Use SQD Network for fast batch data access
+  .setGateway(lookupArchive('eth-mainnet'))
+  // Also connect to RPC for real-time blocks
+  .setRpcEndpoint(process.env.RPC_ENDPOINT)
+  .setFinalityConfirmation(75)
+  .setBlockRange({ from: 18_000_000 })
+  .addLog({
+    address: ['0x...'], // Contract address
+    topic0: [
+      // Transfer(address,address,uint256)
+      '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+    ],
+  })
+  .addTransaction({
+    to: ['0x...'],
+    sighash: ['0xa9059cbb'], // transfer(address,uint256)
+  })
+  .setFields({
+    log: { transactionHash: true },
+    transaction: { from: true, value: true, hash: true },
+  })
+```
+
+### Entity Schema
+```graphql
+# schema.graphql — generates TypeORM entities
+type Token @entity {
+  id: ID!
+  name: String!
+  symbol: String!
+  totalSupply: BigInt!
+  transfers: [Transfer!]! @derivedFrom(field: "token")
+}
+
+type Transfer @entity {
+  id: ID!
+  token: Token!
+  from: String! @index
+  to: String! @index
+  value: BigInt!
+  blockNumber: Int!
+  timestamp: DateTime!
+}
+```
+```bash
+# Generate TypeORM entities from schema
+npx squid-typeorm-codegen
+npx squid-typeorm-migration generate
+```
+
+### Batch Processing Logic
+```typescript
+// src/main.ts
+import { TypeormDatabase } from '@subsquid/typeorm-store'
+import { processor } from './processor'
+import { Transfer } from './model'
+import * as erc721 from './abi/erc721'
+
+processor.run(new TypeormDatabase(), async (ctx) => {
+  const transfers: Transfer[] = []
+
+  for (const block of ctx.blocks) {
+    for (const log of block.logs) {
+      if (log.topics[0] === erc721.events.Transfer.topic) {
+        const { from, to, tokenId } = erc721.events.Transfer.decode(log)
+
+        transfers.push(new Transfer({
+          id: log.id,
+          from,
+          to,
+          tokenId: tokenId.toString(),
+          blockNumber: block.header.height,
+          timestamp: new Date(block.header.timestamp),
+        }))
+      }
+    }
+  }
+
+  // Batch insert — much faster than individual saves
+  await ctx.store.insert(transfers)
+})
+```
+
+### Deployment
+```bash
+# Local development
+docker compose up -d   # Start Postgres
+npx squid-typeorm-migration apply
+node -r dotenv/config lib/main.js
+
+# Deploy to SQD Cloud
+sqd deploy .
+```
+
+### Key Advantages
+| Feature | Detail |
+|---------|--------|
+| **Batch Processing** | Process 1000s of blocks per batch (faster than event-by-event) |
+| **SQD Network** | Decentralized data lake, no RPC needed for historical data |
+| **Multi-chain** | 100+ EVM and Substrate networks supported |
+| **Type-safe** | ABI typegen for events, functions, and multicall |
+| **Multicall Support** | Built-in `Multicall` facade for batch RPC reads |
+| **Real-time** | Connect RPC endpoint for latest blocks |
+
+---
+
+## Envio (HyperSync)
+
+### Setup
+```bash
+npx envio init
+
+# envio.config.ts
+export default {
+  networks: [{
+    id: 1,
+    rpc_url: process.env.ETH_RPC_URL,
+    contracts: [{
+      name: 'Token',
+      address: '0x...',
+      abi_file_path: './abis/Token.json',
+      events: ['Transfer'],
+      start_block: 18_000_000,
+    }],
+  }],
+}
+```
+
+### Event Handlers (Envio)
+```typescript
+import { TokenContract } from '../generated/src/Handlers.gen'
+
+TokenContract.Transfer.handler(async ({ event, context }) => {
+  const transfer = {
+    id: event.transactionHash + '-' + event.logIndex,
+    from: event.params.from,
+    to: event.params.to,
+    value: event.params.value,
+  }
+  context.Transfer.set(transfer)
+})
+```
+
+### HyperSync Advantage
+- **100x faster** than RPC for historical data
+- Raw data streamed from Envio's optimized indices
+- No rate limits or throttling
+
+---
+
 ## Indexer Selection Guide
 
-| Tool | Best For | Language | Hosting |
-|------|----------|----------|---------|
-| **The Graph** | Decentralized, production | AssemblyScript | Decentralized |
-| **Ponder** | TypeScript-native, fast dev | TypeScript | Self-hosted |
-| **Envio** | High-performance, HyperSync | TypeScript | Managed |
-| **Goldsky** | Mirror + Subgraphs | GraphQL | Managed |
-| **Subsquid** | Multi-chain, archive data | TypeScript | Managed |
-| **Custom** | Full control | Any | Self-hosted |
+| Tool | Best For | Language | Speed | Hosting | Multi-chain |
+|------|----------|----------|-------|---------|-------------|
+| **The Graph** | Decentralized, production | AssemblyScript | Medium | Decentralized | ✅ |
+| **Ponder** | TypeScript-native, fast dev | TypeScript | Fast | Self-hosted | ✅ |
+| **Subsquid** | High-throughput, archive data | TypeScript | Very Fast | SQD Cloud | ✅ 100+ |
+| **Envio** | Ultra-fast historical sync | TypeScript | Fastest | Managed | ✅ |
+| **Goldsky** | Mirror + Subgraphs | GraphQL | Fast | Managed | ✅ |
+| **Custom** | Full control | Any | Variable | Self-hosted | Manual |
+
+### When to Use What
+- **Decentralized & battle-tested?** → The Graph
+- **TypeScript-native, fast iteration?** → Ponder
+- **Multi-chain with batch processing?** → Subsquid
+- **Fastest historical sync possible?** → Envio (HyperSync)
+- **Need subgraphs + real-time streams?** → Goldsky
 
 ---
 
@@ -210,16 +409,33 @@ query TopHolders($token: Bytes!) {
     transferCount
   }
 }
+
+# Subsquid-style query with pagination
+query NFTTransfers($owner: String!, $offset: Int) {
+  transfers(
+    where: { to_eq: $owner }
+    limit: 50
+    offset: $offset
+    orderBy: blockNumber_DESC
+  ) {
+    tokenId
+    from
+    to
+    blockNumber
+    timestamp
+  }
+}
 ```
 
 ---
 
 ## Best Practices
 
-- Use `immutable: true` for event entities (never need updates)
+- Use `immutable: true` (Graph) or batch inserts (Subsquid) for event entities
 - Cache derived values instead of computing in queries
-- Use `@derivedFrom` for reverse lookups
+- Use `@derivedFrom` / `@index` for relationship lookups
 - Index only the data you need — less storage, faster sync
-- Handle chain reorgs gracefully
-- Test handlers with Matchstick or local tests
-- Monitor indexing health and sync lag
+- Handle chain reorgs gracefully (use finality confirmations)
+- Test handlers with Matchstick (Graph) or unit tests (others)
+- Monitor indexing health, sync lag, and data freshness
+- Use multicall for batch on-chain reads during indexing
